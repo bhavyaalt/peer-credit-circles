@@ -246,9 +246,13 @@ contract PoolFuzzTest is Test {
 
     // ============ Fuzz: Request Amount ============
 
-    function testFuzz_RequestAmount(uint256 poolSize, uint256 requestAmount) public {
+    function testFuzz_RequestAmount(uint256 poolSize, uint256 requestPercent) public {
         poolSize = bound(poolSize, MIN_DEPOSIT * 2, MAX_DEPOSIT);
-        requestAmount = bound(requestAmount, 1 * 1e18, poolSize);
+        // Request must be <= 30% of pool (contract limit) - use 1-29% to stay safe
+        requestPercent = bound(requestPercent, 100, 2900); // 1% to 29% in bps
+        uint256 requestAmount = (poolSize * requestPercent) / 10000;
+        // Ensure minimum request amount of 1e18
+        if (requestAmount < 1e18) requestAmount = 1e18;
 
         address depositor = address(uint160(uint256(keccak256("depositor"))));
         address requester = address(uint160(uint256(keccak256("requester"))));
@@ -280,9 +284,9 @@ contract PoolFuzzTest is Test {
         Pool.FundingRequest memory request = pool.getRequest(requestId);
         assertEq(request.amount, requestAmount);
 
-        // Check if guardian approval would be needed
+        // Check if guardian approval would be needed (contract uses >=)
         uint256 guardianThreshold = (poolSize * 2000) / 10000; // 20%
-        bool needsGuardian = requestAmount > guardianThreshold;
+        bool needsGuardian = requestAmount >= guardianThreshold;
 
         // Vote to approve
         vm.prank(depositor);
@@ -308,9 +312,13 @@ contract PoolFuzzTest is Test {
 
     // ============ Fuzz: Loan Interest Calculation ============
 
-    function testFuzz_LoanInterest(uint256 principal, uint256 interestBps) public {
-        principal = bound(principal, MIN_DEPOSIT, MAX_DEPOSIT / 10);
+    function testFuzz_LoanInterest(uint256 poolSize, uint256 interestBps) public {
+        // Pool size between min deposit * 5 and max, so we have room for loans
+        poolSize = bound(poolSize, MIN_DEPOSIT * 5, MAX_DEPOSIT);
         interestBps = bound(interestBps, 100, 5000); // 1% to 50%
+        
+        // Loan must be <= 30% of pool - use 20% to stay safe
+        uint256 principal = (poolSize * 2000) / 10000;
 
         address depositor = address(uint160(uint256(keccak256("depositor"))));
         address borrower = address(uint160(uint256(keccak256("borrower"))));
@@ -319,10 +327,10 @@ contract PoolFuzzTest is Test {
         pool.addToWhitelist(depositor);
 
         // Deposit enough funds
-        usdc.mint(depositor, principal * 2);
+        usdc.mint(depositor, poolSize);
         vm.startPrank(depositor);
-        usdc.approve(address(pool), principal * 2);
-        pool.deposit(principal * 2);
+        usdc.approve(address(pool), poolSize);
+        pool.deposit(poolSize);
         vm.stopPrank();
 
         // Borrower needs collateral

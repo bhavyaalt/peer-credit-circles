@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./ShareToken.sol";
+import "./ProjectRegistry.sol";
 
 /**
  * @title Pool
@@ -98,6 +99,24 @@ contract Pool is ReentrancyGuard {
     mapping(address => uint256) public cumulativeRewardPerShare;
     mapping(address => mapping(address => uint256)) public memberRewardDebt;
 
+    // Project contributions
+    ProjectRegistry public projectRegistry;
+    
+    struct ProjectContribution {
+        uint256 projectId;
+        uint256 registryContributionId;
+        uint256 amount;
+        uint256 votingEndsAt;
+        uint256 yesVotes;
+        uint256 noVotes;
+        bool executed;
+        bool approved;
+    }
+    
+    uint256 public nextProjectContributionId;
+    mapping(uint256 => ProjectContribution) public projectContributionsMap;
+    mapping(uint256 => mapping(address => bool)) public hasVotedOnContribution;
+
     // ============ Events ============
 
     event Deposited(address indexed member, uint256 amount, uint256 shares);
@@ -118,6 +137,12 @@ contract Pool is ReentrancyGuard {
     event CollateralDeposited(uint256 indexed requestId, address indexed token, uint256 amount);
     event CollateralReturned(uint256 indexed requestId, address indexed requester, uint256 amount);
     event CollateralSlashed(uint256 indexed requestId, uint256 amount);
+    event ProjectContributionProposed(uint256 indexed contributionId, uint256 indexed projectId, uint256 amount);
+    event ProjectContributionVoted(uint256 indexed contributionId, address indexed voter, bool support, uint256 weight);
+    event ProjectContributionApproved(uint256 indexed contributionId, uint256 indexed projectId);
+    event ProjectContributionRejected(uint256 indexed contributionId, uint256 indexed projectId);
+    event ProjectContributionExecuted(uint256 indexed contributionId, uint256 indexed projectId, uint256 amount);
+    event ProjectRegistryUpdated(address indexed registry);
 
     // ============ Errors ============
 
@@ -144,6 +169,10 @@ contract Pool is ReentrancyGuard {
     error AlreadyApproved();
     error ZeroAmount();
     error InvalidAddress();
+    error NoProjectRegistry();
+    error ContributionNotFound();
+    error ContributionAlreadyExecuted();
+    error ContributionNotApproved();
 
     // ============ Modifiers ============
 
@@ -242,6 +271,152 @@ contract Pool is ReentrancyGuard {
      */
     function toggleOpen() external onlyAdmin {
         isOpen = !isOpen;
+    }
+
+    /**
+     * @notice Set the project registry address
+     * @param _registry Address of the ProjectRegistry contract
+     */
+    function setProjectRegistry(address _registry) external onlyAdmin {
+        if (_registry == address(0)) revert InvalidAddress();
+        projectRegistry = ProjectRegistry(payable(_registry));
+        emit ProjectRegistryUpdated(_registry);
+    }
+
+    // ============ Project Contribution Functions ============
+
+    /**
+     * @notice Propose a contribution to an external project
+     * @param projectId ID of the project in ProjectRegistry
+     * @param amount Amount to contribute
+     */
+    function proposeProjectContribution(uint256 projectId, uint256 amount) external onlyMember returns (uint256) {
+        if (address(projectRegistry) == address(0)) revert NoProjectRegistry();
+        if (amount == 0) revert ZeroAmount();
+        
+        // Check pool has enough funds
+        uint256 availableFunds = totalDeposited - totalPendingFunding;
+        if (amount > availableFunds) revert InsufficientPoolFunds();
+
+        // Register with ProjectRegistry
+        uint256 registryContributionId = projectRegistry.proposeContribution(projectId, amount);
+
+        uint256 contributionId = nextProjectContributionId++;
+
+        projectContributionsMap[contributionId] = ProjectContribution({
+            projectId: projectId,
+            registryContributionId: registryContributionId,
+            amount: amount,
+            votingEndsAt: block.timestamp + config.votingPeriod,
+            yesVotes: 0,
+            noVotes: 0,
+            executed: false,
+            approved: false
+        });
+
+        // Lock the funds
+        totalPendingFunding += amount;
+
+        emit ProjectContributionProposed(contributionId, projectId, amount);
+
+        return contributionId;
+    }
+
+    /**
+     * @notice Vote on a project contribution
+     * @param contributionId ID of the contribution
+     * @param support True for YES, false for NO
+     */
+    function voteOnProjectContribution(uint256 contributionId, bool support) external onlyMember {
+        ProjectContribution storage contribution = projectContributionsMap[contributionId];
+
+        if (contribution.amount == 0) revert ContributionNotFound();
+        if (block.timestamp >= contribution.votingEndsAt) revert VotingEnded();
+        if (hasVotedOnContribution[contributionId][msg.sender]) revert AlreadyVoted();
+        if (contribution.executed) revert ContributionAlreadyExecuted();
+
+        uint256 weight = shareToken.balanceOf(msg.sender);
+
+        if (support) {
+            contribution.yesVotes += weight;
+        } else {
+            contribution.noVotes += weight;
+        }
+
+        hasVotedOnContribution[contributionId][msg.sender] = true;
+
+        emit ProjectContributionVoted(contributionId, msg.sender, support, weight);
+    }
+
+    /**
+     * @notice Finalize voting on a project contribution
+     * @param contributionId ID of the contribution
+     */
+    function finalizeProjectContribution(uint256 contributionId) external {
+        ProjectContribution storage contribution = projectContributionsMap[contributionId];
+
+        if (contribution.amount == 0) revert ContributionNotFound();
+        if (block.timestamp < contribution.votingEndsAt) revert VotingNotEnded();
+        if (contribution.executed) revert ContributionAlreadyExecuted();
+
+        uint256 totalVotes = contribution.yesVotes + contribution.noVotes;
+        uint256 totalShares = shareToken.totalSupply();
+
+        // Check quorum
+        bool quorumMet = (totalVotes * 10000) / totalShares >= config.quorumBps;
+
+        // Check approval threshold
+        bool approved = quorumMet && (contribution.yesVotes * 10000) / totalVotes >= config.approvalThresholdBps;
+
+        contribution.approved = approved;
+
+        // Update ProjectRegistry
+        projectRegistry.updateContributionStatus(contribution.registryContributionId, approved);
+
+        if (approved) {
+            emit ProjectContributionApproved(contributionId, contribution.projectId);
+        } else {
+            // Release locked funds
+            totalPendingFunding -= contribution.amount;
+            contribution.executed = true; // Mark as done (rejected)
+            emit ProjectContributionRejected(contributionId, contribution.projectId);
+        }
+    }
+
+    /**
+     * @notice Execute an approved project contribution
+     * @param contributionId ID of the contribution
+     */
+    function executeProjectContribution(uint256 contributionId) external nonReentrant {
+        ProjectContribution storage contribution = projectContributionsMap[contributionId];
+
+        if (contribution.amount == 0) revert ContributionNotFound();
+        if (!contribution.approved) revert ContributionNotApproved();
+        if (contribution.executed) revert ContributionAlreadyExecuted();
+
+        contribution.executed = true;
+        totalPendingFunding -= contribution.amount;
+        totalDeposited -= contribution.amount;
+
+        // Transfer to ProjectRegistry
+        if (config.depositToken == address(0)) {
+            // ETH
+            projectRegistry.executeContribution{ value: contribution.amount }(contribution.registryContributionId);
+        } else {
+            // ERC20 - approve and let registry pull
+            IERC20(config.depositToken).forceApprove(address(projectRegistry), contribution.amount);
+            projectRegistry.executeContribution(contribution.registryContributionId);
+        }
+
+        emit ProjectContributionExecuted(contributionId, contribution.projectId, contribution.amount);
+    }
+
+    /**
+     * @notice Get project contribution details
+     * @param contributionId ID of the contribution
+     */
+    function getProjectContribution(uint256 contributionId) external view returns (ProjectContribution memory) {
+        return projectContributionsMap[contributionId];
     }
 
     // ============ Member Functions ============

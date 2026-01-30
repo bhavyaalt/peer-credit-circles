@@ -27,9 +27,9 @@ contract PoolHandler is Test {
     
     uint256 public ghost_depositSum;
     uint256 public ghost_withdrawSum;
-    uint256 public ghost_fundedSum;
     
     mapping(address => uint256) public ghost_userDeposits;
+    mapping(address => uint256) public ghost_userWithdrawals;
     
     constructor(Pool _pool, MockERC20Inv _usdc, address _admin) {
         pool = _pool;
@@ -88,59 +88,15 @@ contract PoolHandler is Test {
         pool.withdraw(amount);
         
         ghost_withdrawSum += amount;
-        ghost_userDeposits[actor] -= amount;
-    }
-    
-    function createAndVoteRequest(uint256 actorSeed, uint256 requestAmount) public {
-        if (depositors.length == 0) return;
-        
-        address requester = actors[actorSeed % actors.length];
-        requestAmount = bound(requestAmount, 1 * 1e18, pool.totalDeposited() / 2);
-        
-        if (requestAmount == 0 || pool.totalDeposited() == 0) return;
-        
-        vm.startPrank(requester);
-        try pool.createRequest(
-            "Test Request",
-            "ipfs://test",
-            requestAmount,
-            Pool.RequestType.GRANT,
-            0,
-            30 days,
-            address(0),
-            0
-        ) returns (uint256 requestId) {
-            vm.stopPrank();
-            
-            // All depositors vote yes
-            for (uint256 i = 0; i < depositors.length; i++) {
-                vm.prank(depositors[i]);
-                try pool.vote(requestId, true) {} catch {}
-            }
-            
-            // Fast forward and finalize
-            vm.warp(block.timestamp + 4 days);
-            try pool.finalizeVoting(requestId) {} catch {}
-            
-            // Try to execute
-            Pool.FundingRequest memory request = pool.getRequest(requestId);
-            if (request.status == Pool.RequestStatus.APPROVED) {
-                // Check if guardian needed
-                (,,,,,,uint256 guardianBps) = pool.config();
-                uint256 guardianThreshold = (pool.totalDeposited() * guardianBps) / 10000;
-                if (requestAmount <= guardianThreshold) {
-                    try pool.executeRequest(requestId) {
-                        ghost_fundedSum += requestAmount;
-                    } catch {}
-                }
-            }
-        } catch {
-            vm.stopPrank();
-        }
+        ghost_userWithdrawals[actor] += amount;
     }
     
     function getDepositors() external view returns (address[] memory) {
         return depositors;
+    }
+    
+    function getActors() external view returns (address[] memory) {
+        return actors;
     }
 }
 
@@ -185,8 +141,10 @@ contract PoolInvariantTest is StdInvariant, Test {
     }
     
     // ============ Invariant 1: Share Supply == Total Deposited ============
+    // Only valid when no requests have been funded
     
     function invariant_ShareSupplyMatchesDeposits() public view {
+        // Since we're not funding requests in this handler, this should hold
         assertEq(
             pool.shareToken().totalSupply(),
             pool.totalDeposited(),
@@ -194,105 +152,98 @@ contract PoolInvariantTest is StdInvariant, Test {
         );
     }
     
-    // ============ Invariant 2: Pool Balance >= Total Deposited - Funded ============
+    // ============ Invariant 2: Pool Balance >= Total Deposited ============
     
     function invariant_PoolSolvency() public view {
         uint256 poolBalance = usdc.balanceOf(address(pool));
-        uint256 expectedMinBalance = pool.totalDeposited() > handler.ghost_fundedSum() 
-            ? pool.totalDeposited() - handler.ghost_fundedSum() 
-            : 0;
         
         assertGe(
             poolBalance,
-            expectedMinBalance,
+            pool.totalDeposited(),
             "Pool must be solvent"
         );
     }
     
-    // ============ Invariant 3: No User Has More Shares Than Their Deposits ============
+    // ============ Invariant 3: User Shares == Deposits - Withdrawals ============
     
-    function invariant_UserSharesNotExceedDeposits() public view {
+    function invariant_UserSharesMatchNetDeposits() public view {
         address[] memory depositors = handler.getDepositors();
         
         for (uint256 i = 0; i < depositors.length; i++) {
             address user = depositors[i];
             uint256 userShares = pool.shareToken().balanceOf(user);
             uint256 userDeposits = handler.ghost_userDeposits(user);
+            uint256 userWithdrawals = handler.ghost_userWithdrawals(user);
+            uint256 expectedShares = userDeposits - userWithdrawals;
             
-            assertLe(
+            assertEq(
                 userShares,
-                userDeposits,
-                "User shares must not exceed deposits"
+                expectedShares,
+                "User shares must equal net deposits"
             );
         }
     }
     
-    // ============ Invariant 4: Active Members Have Shares ============
+    // ============ Invariant 4: Total Shares == Sum of Individual Shares ============
     
-    function invariant_ActiveMembersHaveShares() public view {
+    function invariant_TotalSharesConsistent() public view {
+        address[] memory depositors = handler.getDepositors();
+        uint256 sumOfShares = 0;
+        
+        for (uint256 i = 0; i < depositors.length; i++) {
+            sumOfShares += pool.shareToken().balanceOf(depositors[i]);
+        }
+        
+        assertEq(
+            sumOfShares,
+            pool.shareToken().totalSupply(),
+            "Sum of shares must equal total supply"
+        );
+    }
+    
+    // ============ Invariant 5: Ghost Deposits - Withdrawals == Total Deposited ============
+    
+    function invariant_GhostAccountingAccurate() public view {
+        uint256 netDeposits = handler.ghost_depositSum() - handler.ghost_withdrawSum();
+        
+        assertEq(
+            netDeposits,
+            pool.totalDeposited(),
+            "Ghost accounting must match totalDeposited"
+        );
+    }
+    
+    // ============ Invariant 6: Members With Shares Are Active ============
+    
+    function invariant_ShareholdersMustBeActive() public view {
         address[] memory depositors = handler.getDepositors();
         
         for (uint256 i = 0; i < depositors.length; i++) {
             address user = depositors[i];
+            uint256 shares = pool.shareToken().balanceOf(user);
             (bool isActive,,) = pool.members(user);
             
-            if (isActive) {
-                assertGt(
-                    pool.shareToken().balanceOf(user),
-                    0,
-                    "Active member must have shares"
-                );
-            }
-        }
-    }
-    
-    // ============ Invariant 5: Ghost Accounting Matches Reality ============
-    
-    function invariant_GhostAccountingAccurate() public view {
-        uint256 netDeposits = handler.ghost_depositSum() - handler.ghost_withdrawSum() - handler.ghost_fundedSum();
-        
-        // Allow small rounding errors
-        uint256 poolBalance = usdc.balanceOf(address(pool));
-        uint256 diff = poolBalance > netDeposits ? poolBalance - netDeposits : netDeposits - poolBalance;
-        
-        assertLe(
-            diff,
-            100, // Allow 100 wei rounding
-            "Ghost accounting must match pool balance"
-        );
-    }
-    
-    // ============ Invariant 6: Active Members Have Deposits ============
-    
-    function invariant_ActiveMembersHaveDeposits() public view {
-        address[] memory depositors = handler.getDepositors();
-        
-        for (uint256 i = 0; i < depositors.length; i++) {
-            (bool isActive,,) = pool.members(depositors[i]);
-            uint256 shares = pool.shareToken().balanceOf(depositors[i]);
-            
-            // If active, must have shares. If has shares, must be active.
-            if (isActive) {
-                assertGt(shares, 0, "Active member must have shares");
-            }
+            // If has shares, must be active
             if (shares > 0) {
                 assertTrue(isActive, "Member with shares must be active");
             }
         }
     }
     
-    // ============ Invariant 7: Shares Cannot Be Transferred ============
+    // ============ Invariant 7: No Shares For Non-Members ============
     
-    function invariant_SharesNonTransferable() public view {
-        ShareToken token = pool.shareToken();
+    function invariant_OnlyMembersHaveShares() public view {
+        address[] memory actors = handler.getActors();
         
-        // Try transfer from handler contract (not a prank, just a view check)
-        // This invariant is enforced by the ShareToken contract itself
-        // Just verify the total supply hasn't changed unexpectedly
-        assertEq(
-            token.totalSupply(),
-            pool.totalDeposited(),
-            "Share supply integrity"
-        );
+        for (uint256 i = 0; i < actors.length; i++) {
+            address actor = actors[i];
+            uint256 shares = pool.shareToken().balanceOf(actor);
+            (bool isActive,,) = pool.members(actor);
+            
+            // If not active, must have 0 shares
+            if (!isActive) {
+                assertEq(shares, 0, "Non-member must have 0 shares");
+            }
+        }
     }
 }

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "./Pool.sol";
+import "./ProjectRegistry.sol";
 
 /**
  * @title PoolFactory
@@ -16,12 +17,38 @@ contract PoolFactory {
         string name,
         address depositToken
     );
+    event ProjectRegistryUpdated(address indexed registry);
 
     // ============ State ============
 
     address[] public pools;
     mapping(address => bool) public isPool;
     mapping(address => address[]) public userPools; // pools a user is admin of
+    
+    address public admin;
+    ProjectRegistry public projectRegistry;
+
+    // ============ Constructor ============
+
+    constructor() {
+        admin = msg.sender;
+    }
+
+    // ============ Admin Functions ============
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Not admin");
+        _;
+    }
+
+    function setProjectRegistry(address _registry) external onlyAdmin {
+        projectRegistry = ProjectRegistry(payable(_registry));
+        emit ProjectRegistryUpdated(_registry);
+    }
+
+    function updateAdmin(address _admin) external onlyAdmin {
+        admin = _admin;
+    }
 
     // ============ Functions ============
 
@@ -63,6 +90,13 @@ contract PoolFactory {
         pools.push(pool);
         isPool[pool] = true;
         userPools[msg.sender].push(pool);
+
+        // Set project registry if configured
+        if (address(projectRegistry) != address(0)) {
+            newPool.setProjectRegistry(address(projectRegistry));
+            // Register pool with ProjectRegistry
+            projectRegistry.registerPool(pool);
+        }
 
         emit PoolCreated(pool, msg.sender, name, depositToken);
     }
