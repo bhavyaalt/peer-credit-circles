@@ -1,66 +1,117 @@
-## Foundry
+# Peer Credit Circles (PCC) ⚡
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+Decentralized micro-lending/investment pools for friend groups on Base.
 
-Foundry consists of:
+## What is PCC?
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+Friends pool funds together on-chain. External projects can request funding from the pool. Pool members vote on whether to approve. If approved, funds are released. Projects reward the pool, distributed proportionally to each member's contribution.
 
-## Documentation
-
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
+```
+FRIENDS ──deposit──▶ POOL ◀──request── PROJECTS
+   │                  │                    │
+   │                  ▼                    │
+   │        [VOTING + GUARDIANS]           │
+   │                  │                    │
+   └◀─── REWARDS ◀────┴────────────────────┘
+         (proportional)
 ```
 
-### Test
+## Features
 
-```shell
-$ forge test
+- **Invite-only pools** - Friends create private pools
+- **Share-weighted voting** - Vote power = deposit amount
+- **Guardian system** - Large requests (>20% of pool) need guardian approval
+- **Collateral** - Required for loans/investments, optional for grants
+- **Proportional rewards** - Members earn based on their share
+
+## Contracts
+
+| Contract | Description |
+|----------|-------------|
+| `Pool.sol` | Core logic: deposits, voting, requests, rewards |
+| `ShareToken.sol` | Non-transferable ERC20 for pool shares |
+| `PoolFactory.sol` | Factory to create and track pools |
+
+## Request Types
+
+| Type | Collateral | Use Case |
+|------|------------|----------|
+| `GRANT` | Optional | Community funding, no repayment expected |
+| `LOAN` | Required | Working capital, repay with interest |
+| `INVESTMENT` | Required | Equity/token return expected |
+
+## Quick Start
+
+```bash
+# Install dependencies
+forge install
+
+# Build
+forge build
+
+# Test
+forge test -vv
+
+# Deploy (Base Sepolia)
+forge script script/Deploy.s.sol --rpc-url base-sepolia --broadcast
 ```
 
-### Format
+## Configuration
 
-```shell
-$ forge fmt
+When creating a pool:
+
+```solidity
+PoolConfig({
+    name: "Alpha Circle",
+    depositToken: USDC_ADDRESS,     // or address(0) for ETH
+    minDeposit: 100e18,             // 100 USDC minimum
+    votingPeriod: 3 days,
+    quorumBps: 5000,                // 50% must vote
+    approvalThresholdBps: 6000,     // 60% YES to pass
+    guardianThresholdBps: 2000      // 20% triggers guardian approval
+})
 ```
 
-### Gas Snapshots
+## Security
 
-```shell
-$ forge snapshot
+- **ReentrancyGuard** on all fund movements
+- **SafeERC20** for token transfers
+- **Non-transferable shares** (soulbound)
+- **Guardian multi-sig** for large withdrawals
+- **CEI pattern** throughout
+
+## Tests
+
+```
+✅ test_Deposit
+✅ test_MultipleDeposits
+✅ test_Withdraw
+✅ test_CreateGrantRequest
+✅ test_CreateLoanRequestWithCollateral
+✅ test_VoteAndApprove
+✅ test_VoteAndReject
+✅ test_QuorumNotMet
+✅ test_ExecuteSmallRequest
+✅ test_ExecuteLargeRequestNeedsGuardians
+✅ test_ShareTokenNonTransferable
+✅ test_RevertWhen_DepositBelowMin
+✅ test_RevertWhen_DepositNotWhitelisted
+✅ test_RevertWhen_LoanWithoutCollateral
 ```
 
-### Anvil
+## Roadmap
 
-```shell
-$ anvil
-```
+- [x] Core contracts
+- [x] Unit tests (14 passing)
+- [ ] Fuzz tests
+- [ ] Deploy to Base Sepolia
+- [ ] Farcaster Mini App UI
+- [ ] Deploy to Base Mainnet
 
-### Deploy
+## License
 
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
+MIT
 
-### Cast
+---
 
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+Built by Shawn ⚡ for Bhavya
